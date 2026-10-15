@@ -3036,6 +3036,7 @@ class Scheduler(
                 )
             ):
                 matched_len = len(req.prefix_indices) + req.host_hit_length
+                req._peak_matched_len = max(getattr(req, "_peak_matched_len", 0), matched_len)
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
@@ -3627,6 +3628,15 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage:
                 self._retry_missed_storage_prefetches()
+                # Lookahead-3 prefetch: proactively trigger L3 prefetch for the first 3 requests in waiting_queue
+                # while GPU is busy with running_batch, overlapping SSD I/O with GPU compute!
+                for _wreq in self.waiting_queue[:3]:
+                    if _wreq.rid not in self.tree_cache.ongoing_prefetch and getattr(_wreq, "_jit_l3_retries", 0) < 2:
+                        _wreq.init_next_round_input(self.tree_cache, cow_mamba=False)
+                        _cur_m = len(_wreq.prefix_indices) + _wreq.host_hit_length
+                        if _cur_m < getattr(_wreq, "_peak_matched_len", 0):
+                            _wreq._jit_l3_retries = getattr(_wreq, "_jit_l3_retries", 0) + 1
+                            self._prefetch_kvcache(_wreq)
 
         if self.enable_priority_preemption or self.is_hybrid_swa:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -3758,21 +3768,33 @@ class Scheduler(
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
                 if not prefetch_done:
-                    # skip staging requests that are ongoing prefetch
-                    continue
-                # Pop the L3-loaded span. Unified cache exposes its absolute
-                # start so cache-mode L2/L3 attribution survives L3-tail eviction.
+                    if getattr(req, "_l3_stall_start", None) is None:
+                        req._l3_stall_start = time.perf_counter()
+                    break
+                if getattr(req, "_l3_stall_start", None) is not None:
+                    req._l3_head_stall_ms = getattr(req, "_l3_head_stall_ms", 0.0) + (time.perf_counter() - req._l3_stall_start) * 1000.0
+                    req._l3_stall_start = None
                 loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
                     req.rid
                 )
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
                     req.storage_hit_start = loaded_start
-                    # Cache-mode host memory is a resident L2 tier. Buffer mode
-                    # marks the staged span below once it is surfaced.
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            if self.enable_hicache_storage:
+                cur_matched = len(req.prefix_indices) + req.host_hit_length
+                if (
+                    cur_matched < getattr(req, "_peak_matched_len", 0)
+                    and getattr(req, "_jit_l3_retries", 0) < 2
+                ):
+                    req._jit_l3_retries = getattr(req, "_jit_l3_retries", 0) + 1
+                    self._prefetch_kvcache(req)
+                    if req.rid in self.tree_cache.ongoing_prefetch:
+                        if getattr(req, "_l3_stall_start", None) is None:
+                            req._l3_stall_start = time.perf_counter()
+                        break
             if (
                 self.enable_hicache_storage
                 and get_memory().hicache_host_memory_mode == "buffer_only"

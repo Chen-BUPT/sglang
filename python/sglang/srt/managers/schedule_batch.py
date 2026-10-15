@@ -1962,6 +1962,8 @@ class Req(ReqDllmMixin):
             f"rid={self.rid}{bootstrap_info}, "
             f"input_len={len(self.origin_input_ids)}, "
             f"cached_input_len={self.cached_tokens}, "
+            f"l3_hit={getattr(self, 'storage_hit_length', 0)}, "
+            f"l3_stall_ms={getattr(self, '_l3_head_stall_ms', 0.0):.1f}ms, "
             f"output_len={len(self.output_ids)}, "
             f"attempts={self.prefill_attempt_count}, "
             f"type={self.time_stats.disagg_mode_str()})"

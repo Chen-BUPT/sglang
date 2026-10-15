@@ -554,7 +554,7 @@ class HiCacheController:
         self.backup_skip = (
             self.storage_config.is_mla_model
             # todo: load balancing
-            and self.storage_config.tp_rank != 0
+            and (self.storage_config.tp_rank % 8) != 0
         )
 
         # Use storage backend factory for dynamic backend creation
@@ -1016,6 +1016,20 @@ class HiCacheController:
     def _generic_page_get(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
+        if getattr(self.storage_host_pool, "layout", None) in ("page_first", "page_first_direct"):
+            target_views = [
+                self.storage_host_pool.get_data_page(int(host_indices[i * self.page_size]), flat=True)
+                for i in range(len(hash_values))
+            ]
+            page_data = self.storage_backend.batch_get(hash_values, target_views)
+            if page_data is None:
+                return 0
+            count = 0
+            for i in range(len(hash_values)):
+                if page_data[i] is None or operation.is_terminated():
+                    break
+                count += 1
+            return count
         dummy_page_dst = [
             self.storage_host_pool.get_dummy_flat_data_page() for _ in hash_values
         ]
@@ -1048,6 +1062,7 @@ class HiCacheController:
         ]
         all_success = True
         completed_pages = 0
+        _t_l3_start = time.perf_counter()
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             # When an error is occurred, we should keep looping and produce the same number of
             # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
@@ -1082,6 +1097,15 @@ class HiCacheController:
                 operation=operation,
             )
             self.prefetch_sync_queue.put(ack)
+        if completed_pages > 0 and self.tp_rank == 0:
+            _el = max(time.perf_counter() - _t_l3_start, 1e-6)
+            _toks = completed_pages * self.page_size
+            _mb = _toks * 54940.6 / 1e6
+            logger.info(
+                f"[L3_IO_PROFILE] rid={operation.request_id} pages={completed_pages} "
+                f"tokens={_toks} size={_mb:.1f}MB io_ms={_el*1000:.1f}ms "
+                f"bw={(_mb/1000.0)/_el:.2f}GB/s"
+            )
         return completed_pages
 
     def _page_transfer_kv_batch(

@@ -430,7 +430,7 @@ class DSAIndexerPoolHost(HostKVCache):
             (self.layer_num, self.indexer_page_stride_size),
             dtype=self.indexer_dtype,
             device=self.device,
-            pin_memory=self.pin_memory,
+            pin_memory=False,
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:

@@ -80,7 +80,7 @@ class LRUFileEvictor:
 
         # MLA ranks share the same physical files, so centralize LRU bookkeeping
         # on rank 0; non-MLA ranks each own their own files via the suffix.
-        self._is_storage_owner = (not is_mla_model) or (tp_rank == 0)
+        self._is_storage_owner = (not is_mla_model) or ((tp_rank % 8) == 0)
 
         # suffixed_key -> file size in bytes; oldest at front.
         self._lru: OrderedDict[str, int] = OrderedDict()

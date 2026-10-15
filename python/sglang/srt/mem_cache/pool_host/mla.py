@@ -560,7 +560,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             ),
             dtype=self.dtype,
             device=self.device,
-            pin_memory=self.pin_memory,
+            pin_memory=False,
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:

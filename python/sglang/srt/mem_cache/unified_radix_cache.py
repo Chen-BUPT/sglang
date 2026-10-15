@@ -537,6 +537,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
+    def touch_prefix(self, key: RadixKey) -> None:
+        if self.disable:
+            return
+        result = self.tree_core.match_prefix(MatchPrefixParams(key=key))
+        self._apply_cache_actions(result.cache_actions)
+
     def is_chunk_cache(self) -> bool:
         return self.disable
 

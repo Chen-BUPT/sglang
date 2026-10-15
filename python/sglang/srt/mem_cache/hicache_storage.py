@@ -404,7 +404,7 @@ class HiCacheFile(HiCacheStorage):
         if attn_cp_size > 1:
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
 
-        if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
+        if not os.path.exists(self.file_path) and (tp_rank % 8) == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
@@ -438,6 +438,8 @@ class HiCacheFile(HiCacheStorage):
         # module, so a top-level import here would be circular.
         from sglang.srt.mem_cache.storage.file.lru_file_evictor import LRUFileEvictor
 
+        from concurrent.futures import ThreadPoolExecutor
+        self._io_pool = ThreadPoolExecutor(max_workers=16)
         self._evictor = LRUFileEvictor(
             self.file_path,
             self.config_suffix,
@@ -507,12 +509,10 @@ class HiCacheFile(HiCacheStorage):
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
-        return [
-            self.get(key, target_location)
-            for key, target_location in zip(
-                keys, target_locations or [None] * len(keys)
-            )
-        ]
+        locs = target_locations or [None] * len(keys)
+        if len(keys) <= 1:
+            return [self.get(k, loc) for k, loc in zip(keys, locs)]
+        return list(self._io_pool.map(lambda args: self.get(args[0], args[1]), zip(keys, locs)))
 
     def set(
         self,
@@ -570,10 +570,9 @@ class HiCacheFile(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
-        for key, value in zip(keys, values):
-            if not self.set(key, value):
-                return False
-        return True
+        if len(keys) <= 1:
+            return all(self.set(k, v) for k, v in zip(keys, values))
+        return all(self._io_pool.map(lambda args: self.set(args[0], args[1]), zip(keys, values)))
 
     def exists(self, key: str) -> bool:
         key = self._get_suffixed_key(key)
@@ -597,12 +596,11 @@ class HiCacheFile(HiCacheStorage):
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
         if self.metadata_cache is None:
-            existing_files = set()
-            with os.scandir(self.file_path) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name in target_files:
-                        existing_files.add(entry.name)
-            return existing_files
+            return {
+                filename
+                for filename in target_files
+                if os.path.isfile(os.path.join(self.file_path, filename))
+            }
 
         existing_files = set()
         for filename in target_files:
@@ -672,6 +670,9 @@ class HiCacheFile(HiCacheStorage):
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
         storage_key = self._log_key(pool_name, key)
+        if getattr(host_pool, "layout", None) in ("page_first", "page_first_direct"):
+            target_view = host_pool.get_data_page(page_offset, flat=True)
+            return self.get(storage_key, target_view) is not None
         data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
         if data_page is None:
             return False
@@ -706,10 +707,19 @@ class HiCacheFile(HiCacheStorage):
                 results[transfer.name] = [False] * len(keys)
                 continue
 
-            results[transfer.name] = [
-                op_fn(transfer.name, key, host_pool, host_indices[i * page_size].item())
-                for i, key in enumerate(keys)
-            ]
+            offsets = [host_indices[i * page_size].item() for i in range(len(keys))]
+            if len(keys) <= 1:
+                results[transfer.name] = [
+                    op_fn(transfer.name, key, host_pool, off)
+                    for key, off in zip(keys, offsets)
+                ]
+            else:
+                results[transfer.name] = list(
+                    self._io_pool.map(
+                        lambda args: op_fn(transfer.name, args[0], host_pool, args[1]),
+                        zip(keys, offsets),
+                    )
+                )
         return results
 
     def batch_get_v2(

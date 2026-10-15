@@ -260,9 +260,7 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
-            return
-
-        if isinstance(policy, CacheAwarePolicy):
+        elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
@@ -290,6 +288,36 @@ class SchedulePolicy:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
+
+        self._touch_waiting_prefixes(policy, waiting_queue)
+
+    def _touch_waiting_prefixes(self, policy: Policy, waiting_queue: List[Req]) -> None:
+        import time as _time
+        if (
+            isinstance(policy, CacheAwarePolicy)
+            or not waiting_queue
+            or get_disagg().disaggregation_mode == "decode"
+            or self.tree_cache.supports_fast_match_prefix()
+            or not hasattr(self.tree_cache, "touch_prefix")
+        ):
+            return
+        now = _time.monotonic()
+        if now - getattr(self, "_last_waiting_prefix_refresh", float("-inf")) < 0.2:
+            return
+        self._last_waiting_prefix_refresh = now
+        # Protect top-5 requests near head of waiting_queue so they are never evicted while waiting
+        for r in reversed(waiting_queue[:5]):
+            token_ids = r.origin_input_ids + r.output_ids
+            reprefill_tail = self.tree_cache.swa_reprefill_tail_tokens()
+            key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+            self.tree_cache.touch_prefix(
+                RadixKey(
+                    token_ids=token_ids,
+                    extra_key=r.extra_key,
+                    limit=key_limit,
+                    cache_salt=r.cache_salt,
+                )
+            )
 
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if self.policy == CacheAwarePolicy.LPM and len(waiting_queue) > 128:
