@@ -31,6 +31,11 @@ from collections import OrderedDict
 from typing import Any, Callable, Optional, Set, Tuple
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_file_layout import (
+    existing_bin_path,
+    iter_stored_bins,
+    sharded_bin_path,
+)
 from sglang.srt.utils.common import human_readable_int
 
 logger = logging.getLogger(__name__)
@@ -297,19 +302,11 @@ class LRUFileEvictor:
 
     def _scan_existing_files(self) -> None:
         """Seed LRU index from disk on startup (oldest mtime first)."""
-        try:
-            names = os.listdir(self.file_path)
-        except FileNotFoundError:
-            return
         entries = []
-        for fn in names:
-            if not fn.endswith(".bin"):
-                continue
-            stem = fn[:-4]
+        for stem, fp in iter_stored_bins(self.file_path):
             # Only files belonging to this rank/model.
             if not stem.endswith(self.config_suffix):
                 continue
-            fp = os.path.join(self.file_path, fn)
             try:
                 st = os.stat(fp)
             except OSError:
@@ -340,7 +337,9 @@ class LRUFileEvictor:
             # Keep in-flight reservations; their file isn't committed yet.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
-        tensor_path = os.path.join(self.file_path, f"{evict_stem}.bin")
+        tensor_path = existing_bin_path(self.file_path, evict_stem)
+        if tensor_path is None:
+            tensor_path = sharded_bin_path(self.file_path, evict_stem)
         try:
             os.remove(tensor_path)
             freed = evict_size

@@ -13,6 +13,11 @@ from typing import TYPE_CHECKING, Any, List, Optional, Set
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_file_layout import (
+    existing_bin_path,
+    iter_stored_bins,
+    sharded_bin_path,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.pool_host import HostKVCache
@@ -462,19 +467,12 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_path(
         self, key: str, component_name: Optional[str] = None
     ) -> str:
-        return os.path.join(
-            self.file_path, f"{self._get_component_key(key, component_name)}.bin"
+        return sharded_bin_path(
+            self.file_path, self._get_component_key(key, component_name)
         )
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
-        try:
-            names = os.listdir(self.file_path)
-        except FileNotFoundError:
-            return
-        for fn in names:
-            if not fn.endswith(".bin"):
-                continue
-            stem = fn[:-4]
+        for stem, _path in iter_stored_bins(self.file_path):
             # Only files belonging to this rank/model.
             if stem.endswith(self.config_suffix):
                 self.metadata_cache.add(stem)
@@ -486,7 +484,12 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> torch.Tensor | None:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
+        tensor_path = existing_bin_path(self.file_path, suffixed)
+        if tensor_path is None:
+            if self.metadata_cache is not None:
+                self.metadata_cache.remove(suffixed)
+            logger.warning(f"Failed to fetch {key} from HiCacheFile storage.")
+            return None
         try:
             expected = target_location.numel() * target_location.element_size()
             with open(tensor_path, "rb", buffering=0) as f:
@@ -522,13 +525,15 @@ class HiCacheFile(HiCacheStorage):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         suffixed = self._get_suffixed_key(key)
-        tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
 
         # Fast path: same key already on disk. Refresh recency and skip rewrite.
         if self.exists(key):
             logger.debug(f"Key {key} already exists. Skipped.")
-            self._evictor.touch(suffixed, tensor_path)
+            located = existing_bin_path(self.file_path, suffixed)
+            if located is not None:
+                self._evictor.touch(suffixed, located)
             return True
+        tensor_path = sharded_bin_path(self.file_path, suffixed)
 
         tmp_path = None
         reserved = False
@@ -538,6 +543,7 @@ class HiCacheFile(HiCacheStorage):
             if not self._evictor.reserve(suffixed, value_bytes, key=key):
                 return False
             reserved = True
+            os.makedirs(os.path.dirname(tensor_path), exist_ok=True)
 
             tmp_path = (
                 f"{tensor_path}.tmp."
@@ -578,8 +584,7 @@ class HiCacheFile(HiCacheStorage):
         key = self._get_suffixed_key(key)
         if self.metadata_cache is not None and self.metadata_cache.contains(key):
             return True
-        tensor_path = os.path.join(self.file_path, f"{key}.bin")
-        if os.path.exists(tensor_path):
+        if existing_bin_path(self.file_path, key) is not None:
             if self.metadata_cache is not None:
                 self.metadata_cache.add(key)
             return True
@@ -599,7 +604,7 @@ class HiCacheFile(HiCacheStorage):
             return {
                 filename
                 for filename in target_files
-                if os.path.isfile(os.path.join(self.file_path, filename))
+                if existing_bin_path(self.file_path, filename[:-4]) is not None
             }
 
         existing_files = set()
@@ -607,11 +612,9 @@ class HiCacheFile(HiCacheStorage):
             stem = filename[:-4]
             if self.metadata_cache.contains(stem):
                 existing_files.add(filename)
-            else:
-                path = os.path.join(self.file_path, filename)
-                if os.path.exists(path):
-                    self.metadata_cache.add(stem)
-                    existing_files.add(filename)
+            elif existing_bin_path(self.file_path, stem) is not None:
+                self.metadata_cache.add(stem)
+                existing_files.add(filename)
         return existing_files
 
     def batch_exists_v2(
@@ -738,10 +741,8 @@ class HiCacheFile(HiCacheStorage):
 
     def clear(self) -> bool:
         try:
-            for filename in os.listdir(self.file_path):
-                file_path = os.path.join(self.file_path, filename)
-                if os.path.isfile(file_path):
-                    os.remove(file_path)
+            for _stem, file_path in iter_stored_bins(self.file_path):
+                os.remove(file_path)
             self._evictor.clear()
             if self.metadata_cache is not None:
                 self.metadata_cache.clear()

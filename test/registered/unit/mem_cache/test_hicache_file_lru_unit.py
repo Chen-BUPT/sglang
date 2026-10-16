@@ -516,26 +516,69 @@ class TestHiCacheFileMetadataIntegration(HiCacheFileLRUTestBase):
         b.set("k1", _t(50))
         b.set("k2", _t(50))
 
-        # Now patch os.scandir and os.path.exists
+        # Now patch os.scandir and the sharded lookup's isfile.
         with (
             mock.patch("os.scandir") as mock_scandir,
-            mock.patch("os.path.exists") as mock_exists,
+            mock.patch(
+                "sglang.srt.mem_cache.hicache_file_layout.os.path.isfile"
+            ) as mock_isfile,
         ):
-            mock_exists.return_value = True
+            mock_isfile.return_value = True
 
-            # batch_exists_v2 for k1 and k2 should hit the metadata cache and NOT call os.scandir or os.path.exists
+            # batch_exists_v2 for k1 and k2 should hit the metadata cache and NOT call os.scandir or isfile
             res = b.batch_exists_v2(["k1", "k2"])
             self.assertEqual(res.kv_hit_pages, 2)
             mock_scandir.assert_not_called()
-            mock_exists.assert_not_called()
+            mock_isfile.assert_not_called()
 
-            # Querying "k3" (miss) should fall back to os.path.exists once but still NOT call os.scandir
+            # Querying "k3" (miss) should fall back to isfile once but still NOT call os.scandir
             res = b.batch_exists_v2(["k3"])
             self.assertEqual(
                 res.kv_hit_pages, 1
-            )  # since mock_exists returns True, k3 exists physically
+            )  # since mock_isfile returns True, the sharded path looks present
             mock_scandir.assert_not_called()
-            mock_exists.assert_called_once()
+            mock_isfile.assert_called_once()
+
+
+class TestShardedLayout(HiCacheFileLRUTestBase):
+    def test_set_writes_two_level_bucket(self):
+        from sglang.srt.mem_cache.hicache_file_layout import (
+            flat_bin_path,
+            sharded_bin_path,
+        )
+
+        b = self.make_backend()
+        self.assertTrue(b.set("page", _t(32, fill=7)))
+        suffixed = b._get_suffixed_key("page")
+        sharded = sharded_bin_path(b.file_path, suffixed)
+        self.assertTrue(os.path.isfile(sharded))
+        self.assertFalse(os.path.isfile(flat_bin_path(b.file_path, suffixed)))
+        parts = os.path.relpath(sharded, b.file_path).split(os.sep)
+        self.assertEqual(len(parts), 3)
+        self.assertEqual(len(parts[0]), 2)
+        self.assertEqual(len(parts[1]), 2)
+        out = _t(32)
+        self.assertIsNotNone(b.get("page", out))
+        self.assertTrue(torch.equal(out, _t(32, fill=7)))
+
+    def test_flat_legacy_file_still_readable(self):
+        b = self.make_backend()
+        suffixed = b._get_suffixed_key("old")
+        flat = os.path.join(b.file_path, f"{suffixed}.bin")
+        with open(flat, "wb") as f:
+            f.write(bytes([3]) * 16)
+        out = _t(16)
+        self.assertIsNotNone(b.get("old", out))
+        self.assertTrue(torch.equal(out, _t(16, fill=3)))
+
+    def test_evict_unlinks_sharded_file(self):
+        from sglang.srt.mem_cache.hicache_file_layout import existing_bin_path
+
+        b = self.make_backend(max_size="150")
+        self.assertTrue(b.set("a", _t(100)))
+        self.assertTrue(b.set("b", _t(100)))
+        self.assertIsNone(existing_bin_path(b.file_path, b._get_suffixed_key("a")))
+        self.assertIsNotNone(existing_bin_path(b.file_path, b._get_suffixed_key("b")))
 
 
 if __name__ == "__main__":
